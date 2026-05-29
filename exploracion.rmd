@@ -9,9 +9,6 @@ library(rsample)
 library(modeldata)
 set.seed(12345)
 data("clients")
-train_test_split <- initial_split(clients)
-client_train <- training(train_test_split)
-client_test <- testing(train_test_split)
 ```
 
 ```{r}
