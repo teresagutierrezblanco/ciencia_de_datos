@@ -1,0 +1,176 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r, message=FALSE, warning=FALSE}
+library(tidymodels)
+library(themis)
+library(yardstick)
+library(dplyr)
+
+data("clients")
+
+clients$Exited <- factor(clients$Exited)
+clients$HasCrCard <- factor(clients$HasCrCard)
+clients$IsActiveMember <- factor(clients$IsActiveMember)
+
+set.seed(12345)
+train_test_split <- initial_split(clients, strata = Exited)
+client_train <- training(train_test_split)
+client_test <- testing(train_test_split)
+```
+
+```{r}
+receta_avanzada <- recipe(Exited ~ ., data = client_train) %>%
+  update_role(Exited, new_role = "outcome") %>%
+  step_rm(CustomerId, Surname, HasCrCard) %>%
+  
+  step_mutate(
+    BalanceSalaryRatio = ifelse(EstimatedSalary > 0, Balance / EstimatedSalary, 0),
+    NumOfProducts_grouped = factor(ifelse(NumOfProducts >= 3, "3+", as.character(NumOfProducts))),
+    is_germany = ifelse(Geography == "Germany", 1, 0),
+    Gender_Active = factor(paste(Gender, ifelse(IsActiveMember == 1, "Activo", "Inactivo")))
+  ) %>%
+  step_rm(NumOfProducts, EstimatedSalary) %>% 
+  
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_center(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors()) 
+```
+
+```{r}
+rf_spec <- rand_forest() %>% set_engine("ranger") %>% set_mode("classification")
+
+xgb_spec <- boost_tree(trees = 300, tree_depth = tune(), learn_rate = tune()) %>%
+  set_engine("xgboost") %>% set_mode("classification")
+
+nn_spec <- mlp(hidden_units = tune(), epochs = tune()) %>%
+  set_engine("nnet") %>% set_mode("classification")
+```
+
+```{r}
+set.seed(123)
+folds <- vfold_cv(client_train, v = 3)
+
+rf_wkflw <- workflow() %>% add_recipe(receta_avanzada) %>% add_model(rf_spec)
+rf_fit <- fit(rf_wkflw, data = client_train)
+
+xgb_wkflw <- workflow() %>% add_recipe(receta_avanzada) %>% add_model(xgb_spec)
+xgb_tuned <- tune_grid(xgb_wkflw, resamples = folds, grid = 5, metrics = metric_set(f_meas))
+best_xgb <- select_best(xgb_tuned, metric = "f_meas")
+xgb_fit <- finalize_workflow(xgb_wkflw, best_xgb) %>% fit(data = client_train)
+
+nn_wkflw <- workflow() %>% add_recipe(receta_avanzada) %>% add_model(nn_spec)
+nn_tuned <- tune_grid(nn_wkflw, resamples = folds, grid = 5, metrics = metric_set(f_meas))
+best_nn <- select_best(nn_tuned, metric = "f_meas")
+nn_fit <- finalize_workflow(nn_wkflw, best_nn) %>% fit(data = client_train)
+```
+
+```{r}
+umbral <- 0.3
+aplicar_umbral <- function(modelo_fit, datos, nombre_modelo) {
+  prob <- predict(modelo_fit, new_data = datos, type = "prob")
+  
+  datos %>%
+    select(Exited) %>%
+    bind_cols(prob) %>%
+    mutate(
+     .pred_class_umbral = factor(ifelse(.pred_1 >= umbral, "1", "0"), levels = c("0", "1")),
+      Modelo = nombre_modelo
+    )
+}
+
+preds_rf_adv <- aplicar_umbral(rf_fit, client_test, "Random Forest")
+preds_xgb_adv <- aplicar_umbral(xgb_fit, client_test, "XGBoost")
+preds_nn_adv <- aplicar_umbral(nn_fit, client_test, "Red Neuronal")
+
+prob_media_test <- (predict(xgb_fit, new_data = client_test, type = "prob")$.pred_1 + 
+                    predict(rf_fit, new_data = client_test, type = "prob")$.pred_1) / 2
+preds_ensemble_adv <- client_test %>%
+  select(Exited) %>%
+  mutate(
+    .pred_0 = 1 - prob_media_test,
+    .pred_1 = prob_media_test,
+    .pred_class_umbral = factor(ifelse(.pred_1 >= umbral, "1", "0"), levels = c("0", "1")),
+    Modelo = "Ensemble (XGB+RF)"
+  )
+todas_las_preds_adv <- bind_rows(preds_rf_adv, preds_xgb_adv, preds_nn_adv, preds_ensemble_adv)
+```
+
+```{r}
+comparativa_f1_adv <- todas_las_preds_adv %>%
+  group_by(Modelo) %>%
+  f_meas(truth = Exited, estimate = .pred_class_umbral, event_level = "second") %>%
+  arrange(desc(.estimate))
+
+print(comparativa_f1_adv)
+
+library(ggplot2)
+ggplot(comparativa_f1_adv, aes(x = reorder(Modelo, .estimate), y = .estimate, fill = Modelo)) +
+  geom_col() +
+  coord_flip() +
+  theme_minimal() +
+  expand_limits(y = 1.0) + 
+  labs(title = paste("Comparativa F1-Score Variables Sintéticas"),
+       x = "Modelo",
+       y = "F1-Score") +
+  geom_text(aes(label = round(.estimate, 3)), hjust = -0.2)
+```
+
+```{r}
+
+library(vip)
+
+xgb_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip(geom = "col", num_features = 15) + 
+  theme_minimal() +
+  labs(title = "Importancia de las Variables (XGBoost)",
+       x = "Importancia",
+       y = "Variables")
+
+```
+
+```{r}
+data("clients_kaggle")
+clients_kaggle$HasCrCard <- factor(clients_kaggle$HasCrCard)
+clients_kaggle$IsActiveMember <- factor(clients_kaggle$IsActiveMember)
+
+pred <- predict(rf_fit, new_data = clients_kaggle, type = "prob")
+prediccion_kaggle <-factor(ifelse(pred$.pred_1 >= umbral, "1", "0"), levels = c("0", "1"))
+
+submission <- clients_kaggle %>% 
+  select(CustomerId) %>% 
+  bind_cols(Exited = prediccion_kaggle)
+    
+ write.csv(submission, "modelo_mejorado.csv", row.names = FALSE, quote = FALSE)
+```
+
+
+```{r}
+data("clients_kaggle")
+
+clients_kaggle$HasCrCard <- factor(clients_kaggle$HasCrCard)
+clients_kaggle$IsActiveMember <- factor(clients_kaggle$IsActiveMember)
+
+prob_xgb_kaggle <- predict(xgb_fit, new_data = clients_kaggle, type = "prob")
+
+prob_rf_kaggle <- predict(rf_fit, new_data = clients_kaggle, type = "prob")
+
+prob_media_kaggle <- (prob_xgb_kaggle$.pred_1 + prob_rf_kaggle$.pred_1) / 2
+
+prediccion_kaggle <- factor(ifelse(prob_media_kaggle >= umbral, "1", "0"), levels = c("0", "1"))
+
+submission <- clients_kaggle %>% 
+  select(CustomerId) %>% 
+  bind_cols(Exited = prediccion_kaggle)
+
+write.csv(submission, "modelo_ensemble.csv", row.names = FALSE, quote = FALSE)
+
+
+```
+

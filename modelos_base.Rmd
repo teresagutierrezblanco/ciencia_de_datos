@@ -1,0 +1,143 @@
+---
+output: html_notebook
+---
+
+
+```{r, message=FALSE, warning=FALSE}
+library(tidymodels)
+library(themis)
+library(yardstick)
+library(recipes)
+library(rsample)
+library(modeldata)
+
+data("clients")
+
+clients$Exited <- factor(clients$Exited)
+clients$HasCrCard <- factor(clients$HasCrCard)
+clients$IsActiveMember <- factor(clients$IsActiveMember)
+
+set.seed(12345)
+train_test_split <- initial_split(clients, strata = Exited)
+client_train <- training(train_test_split)
+client_test <- testing(train_test_split)
+```
+
+```{r}
+receta_base <- recipe(Exited ~ ., data = client_train) %>%
+  update_role(Exited, new_role = "outcome") %>%
+  step_rm(CustomerId, Surname) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_center(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors()) %>%
+  step_smote(Exited)
+```
+
+```{r}
+rf_spec <- rand_forest() %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+xgb_spec <- boost_tree(
+  trees = 300, 
+  tree_depth = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+nn_spec <- mlp(
+  hidden_units = tune(),
+  epochs = tune()
+) %>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+```
+
+```{r}
+set.seed(123)
+folds <- vfold_cv(client_train, v = 3) 
+
+rf_wkflw <- workflow() %>% add_recipe(receta_base) %>% add_model(rf_spec)
+rf_fit <- fit(rf_wkflw, data = client_train)
+
+xgb_wkflw <- workflow() %>% add_recipe(receta_base) %>% add_model(xgb_spec)
+xgb_tuned <- tune_grid(
+  xgb_wkflw,
+  resamples = folds,
+  grid = 5,
+  metrics = metric_set(f_meas)
+)
+best_xgb <- select_best(xgb_tuned, metric = "f_meas")
+xgb_fit <- finalize_workflow(xgb_wkflw, best_xgb) %>% fit(data = client_train)
+
+nn_wkflw <- workflow() %>% add_recipe(receta_base) %>% add_model(nn_spec)
+nn_tuned <- tune_grid(
+  nn_wkflw,
+  resamples = folds,
+  grid = 5,
+  metrics = metric_set(f_meas)
+)
+best_nn <- select_best(nn_tuned, metric = "f_meas")
+nn_fit <- finalize_workflow(nn_wkflw, best_nn) %>% fit(data = client_train)
+```
+
+```{r}
+preds_rf <- predict(rf_fit, new_data = client_test) %>%
+  bind_cols(client_test %>% select(Exited)) %>%
+  mutate(Modelo = "Random Forest")
+
+preds_xgb <- predict(xgb_fit, new_data = client_test) %>%
+  bind_cols(client_test %>% select(Exited)) %>%
+  mutate(Modelo = "XGBoost")
+
+preds_nn <- predict(nn_fit, new_data = client_test) %>%
+  bind_cols(client_test %>% select(Exited)) %>%
+  mutate(Modelo = "Red Neuronal")
+
+todas_las_preds <- bind_rows(preds_rf, preds_xgb, preds_nn)
+```
+
+```{r}
+comparativa_f1 <- todas_las_preds %>%
+  group_by(Modelo) %>%
+  f_meas(truth = Exited, estimate = .pred_class, event_level = "second") %>%
+  arrange(desc(.estimate))
+
+print(comparativa_f1)
+
+library(ggplot2)
+ggplot(comparativa_f1, aes(x = reorder(Modelo, .estimate), y = .estimate, fill = Modelo)) +
+  geom_col() +
+  coord_flip() +
+  theme_minimal() +
+   expand_limits(y = 1.0) + 
+  labs(title = "Comparativa de F1-Score por Modelo",
+       x = "Modelo",
+       y = "F1-Score") +
+  geom_text(aes(label = round(.estimate, 3)), hjust = -0.2)
+```
+```{r}
+library(vip)
+xgb_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip(geom = "col") + 
+  theme_minimal() +
+  labs(title = "Importancia de las Variables (XGBoost)",
+       x = "Importancia",
+       y = "Variables")
+```
+
+
+```{r}
+data("clients_kaggle")
+clients_kaggle$HasCrCard <- factor(clients_kaggle$HasCrCard)
+clients_kaggle$IsActiveMember <- factor(clients_kaggle$IsActiveMember)
+
+preds_ganador <- predict(xgb_fit, new_data = clients_kaggle) 
+submission <- clients_kaggle %>% select(CustomerId) %>% bind_cols(Exited = preds_ganador$.pred_class)
+
+write.csv(submission, "modelo_sin_mejoras.csv", row.names = FALSE, quote = FALSE)
+```
